@@ -6,9 +6,7 @@
 
 #include <sys/ioctl.h>
 #include <net/if.h>
-#include <linux/if.h>
 #include <linux/if_tun.h>
-#include <linux/if_ether.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -16,7 +14,9 @@
 #include "../external/log.h"
 
 // success return 0
-int channel_tun_init(channel_tun_t *tun, const char *device_name) {
+int channel_tun_init(channel_tun_t *tun, const char *device_name, uev_ctx_t *ctx) {
+    tun->fd = -1;
+    tun->read_watcher = NULL;
     tun->packet_ready = NULL;
     if (strlen(device_name) >= IF_NAMESIZE) {
         log_fatal("device_name too long: %s", device_name);
@@ -40,57 +40,50 @@ int channel_tun_init(channel_tun_t *tun, const char *device_name) {
         return err;
     } else {
         tun -> fd = fd;
+        tun -> read_watcher = malloc(sizeof(uev_t));
+        uev_io_init(ctx, tun->read_watcher, channel_tun_incoming_packet_ev, tun, tun->fd, UEV_READ);
         return fd;
     }
 }
 
-// return actual size read.
-ssize_t channel_tun_read(const channel_tun_t *tun, uint8_t buffer[], size_t size) {
-    if (size < 0) {
-        log_error("invalid write size: %ld", size);
-        return -2;
+void channel_tun_close(channel_tun_t *tun) {
+    if (tun->read_watcher != NULL) {
+        uev_io_stop(tun->read_watcher);
+        free(tun->read_watcher);
+        tun->read_watcher = NULL;
     }
-
-    ssize_t len = read(tun->fd, buffer, size);
-    if (len < 0) return -1;
-    if (len >= size) {
-        log_warn("buffer full, read maybe incomplete %ld >= %ld", len, size);
+    if (tun->fd > 0) {
+        close(tun->fd);
+        tun->fd = -1;
     }
-    return len;
 }
 
-// success return size, syscall failure -1, other failure -2
-// NOTE: the buffer should contain the tun_pi header
-ssize_t channel_tun_write(const channel_tun_t *tun, uint8_t buffer[], size_t size) {
-    if (size < 0 || size > ETH_MAX_MTU) {
-        log_error("invalid write size: %ld", size);
-        return -2;
-    }
+void channel_tun_incoming_packet_ev(uev_t *w, void *arg, int events) {
+    channel_tun_t *tun = arg;
+    size_t buffer_size = sizeof(uint8_t) * (ETH_MAX_MTU + sizeof(struct tun_pi) + 2);
+    uint8_t *buffer = malloc(buffer_size);
+    ssize_t len = read(tun->fd, buffer, buffer_size);
 
-    ssize_t err = write(tun->fd, buffer, size);
-    if (err < 0) {
-        return -1;
+    if (len < 0) {
+        log_fatal("tun read() error: %s", strerror(errno));
+        uev_exit(w->ctx);
     } else {
+        struct tun_pi *pi = (struct tun_pi *) buffer;
+        log_info("Received packet EtherType=0x%04x, size=%ld", ntohs(pi->proto), len - sizeof(*pi));
+        if (tun->packet_ready == NULL) {
+            log_warn("tun packet_ready is NULL");
+        } else {
+            tun->packet_ready(tun, buffer, (size_t) len);
+        }
+    }
+    free(buffer);
+}
+
+int channel_tun_write(channel_tun_t *tun, const uint8_t buffer[], size_t size) {
+    if (tun->fd < 0) {
+        log_warn("tun channel not ready");
         return 0;
     }
-}
-
-void tun_incoming_packet(uev_t *w, void *arg, int events) {
-    channel_tun_t *tun = arg;
-
-    uint8_t packet[2 + ETH_MAX_MTU]; // magic
-    ssize_t pkt_size = channel_tun_read(tun, packet + 2, ETH_MAX_MTU);
-    if (pkt_size < 0) {
-        log_error("tun read error: %s", strerror(errno));
-        uev_io_stop(w);
-        return;
-    }
-
-    struct tun_pi *pi = (struct tun_pi*) packet + 2;
-    log_info("Received packet proto=%d, size=%ld", pi->proto, pkt_size - sizeof(*pi));
-
-    if (tun->packet_ready == NULL)
-        log_warn("tun packet_ready is NULL");
-    else
-        tun->packet_ready(tun, packet, (size_t)pkt_size);
+    ssize_t len = write(tun->fd, buffer, size);
+    return len < 0 ? -1 : 0;
 }

@@ -18,125 +18,174 @@ static int set_fd_non_block(int fd) {
     return 0;
 }
 
-void simple_tcp_conn_init(channel_simple_tcp_conn_t *conn) {
-    conn ->fd = -1;
-    conn->packet_ready = NULL;
-    conn->recd_size=0;
-    conn->recv_size=0;
-}
-
 void simple_tcp_init(channel_simple_tcp_t *tcp) {
+    memset(tcp, 0, sizeof(*tcp));
     tcp->listen_fd = -1;
-    tcp->opened_channels = 0;
-    tcp->default_packet_ready = NULL;
+    tcp->channel_fd = -1;
 }
 
-// return listen fd, or -1 on failure
-int simple_tcp_listen(channel_simple_tcp_t *tcp, const char *addr, const char *service) {
+void simple_tcp_clean(channel_simple_tcp_t *tcp) {
+    simple_tcp_deafen(tcp);
+    simple_tcp_disconnect(tcp);
+    simple_tcp_init(tcp);
+}
+
+int simple_tcp_listen(channel_simple_tcp_t *tcp, const char *addr, const char *service, uev_ctx_t *ctx) {
     struct addrinfo *listen_addr;
-    int err;
-    err = getaddrinfo(addr, service, NULL, &listen_addr);
-    if (err != 0) return -1;
+    int fd = -1;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    tcp->listen_fd = fd;
-    if (fd < 0) return -1;
-
-    if (set_fd_non_block(fd) < 0) return -1;
-
-    err = bind(fd, listen_addr->ai_addr, listen_addr->ai_addrlen);
-    if (err < 0) return -1;
-
-    err = listen(fd, SOMAXCONN);
-    if (err < 0) return -1;
+    if (0 != getaddrinfo(addr, service, NULL, &listen_addr)) goto err;
+    if (0 > (fd = socket(AF_INET, SOCK_STREAM, 0))) goto err;
+    if (0 > bind(fd, listen_addr->ai_addr, listen_addr->ai_addrlen)) goto err;
+    if (0 > listen(fd, SOMAXCONN)) goto err;
+    if (0 > set_fd_non_block(fd)) goto err;
 
     freeaddrinfo(listen_addr);
+    tcp->listen_fd = fd;
+    tcp->listen_watcher = malloc(sizeof(uev_t));
+    uev_io_init(ctx, tcp->listen_watcher, simple_tcp_incoming_conn_ev, tcp, fd, UEV_READ);
     return fd;
+err:
+    if (fd >= 0) close(fd);
+    return -1;
 }
 
-// return new connection id, or -1 on failure
-int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *service) {
-    struct addrinfo *peer_addr;
-    int err;
-    err = getaddrinfo(addr, service, NULL, &peer_addr);
-    if (err != 0) return -1;
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    err = connect(fd, peer_addr->ai_addr, peer_addr->ai_addrlen);
-    if (err < 0) return -1;
-
-    if (set_fd_non_block(fd) < 0) return -1;
-
-    freeaddrinfo(peer_addr);
-    channel_simple_tcp_conn_t *conn = malloc(sizeof(*conn));
-    simple_tcp_conn_init(conn);
-    conn->fd = fd;
-    conn->packet_ready = tcp -> default_packet_ready;
-
-    tcp->channels[tcp->opened_channels++] = conn;
-    return tcp->opened_channels-1;
-}
-
-void simple_tcp_incoming_data(uev_t *w, void *arg, int events) {
-    channel_simple_tcp_conn_t *conn = arg;
-
-    if (conn->recv_size > 0) {
-        ssize_t recv_len = recv(w->fd, conn->recv_buf.pkt+conn->recd_size, conn->recv_size - conn->recd_size, 0);
-        if (recv_len < 0 && errno != EAGAIN) {
-            log_error("recv() fail: %s", strerror(errno));
-            uev_io_stop(w);
-            return;
-        }
-
-        conn->recd_size += recv_len;
-        if (conn->recd_size == conn->recv_size) {
-            if (conn->packet_ready == NULL)
-                log_warn("packet_ready is NULL");
-            else
-                conn->packet_ready(conn, conn->recv_buf.pkt, conn->recv_size);
-            conn->recv_size = 0;
-            conn->recd_size = 0;
-        }
-    } else { // HEADER NOT READY
-        ssize_t recv_len = recv(w->fd, &conn->recv_buf+conn->recd_size, SIMPLE_TCP_HEADER_LEN - conn->recd_size, 0);
-        if (recv_len < 0 && errno != EAGAIN) {
-            log_error("recv() fail: %s", strerror(errno));
-            uev_io_stop(w);
-            return;
-        }
-
-        conn->recd_size += recv_len;
-        if (conn->recd_size == SIMPLE_TCP_HEADER_LEN) {
-            conn->recv_size = ntohs(conn->recv_buf.pkt_size_be);
-            conn->recd_size = 0;
-            log_info("incoming packet of size=%d", conn->recv_size);
-        }
+void simple_tcp_deafen(channel_simple_tcp_t *tcp) {
+    if (tcp->listen_watcher != NULL) {
+        uev_io_stop(tcp->listen_watcher);
+        free(tcp->listen_watcher);
+        tcp->listen_watcher = NULL;
+    }
+    if (tcp->listen_fd >= 0) {
+        close(tcp->listen_fd);
+        tcp->listen_fd = -1;
     }
 }
 
-void simple_tcp_incoming_conn(uev_t *w, void *arg, int events) {
+int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *service, uev_ctx_t *ctx) {
+    struct addrinfo *peer_addr;
+    int fd = -1;
+
+    if (0 != getaddrinfo(addr, service, NULL, &peer_addr)) goto err;
+    if (0 > (fd = socket(AF_INET, SOCK_STREAM, 0))) goto err;
+    if (0 > connect(fd, peer_addr->ai_addr, peer_addr->ai_addrlen)) goto err;
+    if (0 > set_fd_non_block(fd)) goto err;
+
+    freeaddrinfo(peer_addr);
+    tcp->channel_fd = fd;
+    tcp->recv_watcher = malloc(sizeof(uev_t));
+    uev_io_init(ctx, tcp->recv_watcher, simple_tcp_incoming_data_ev, tcp, fd, UEV_READ);
+    log_info("Connected to remote host %s:%s", addr, service);
+    return fd;
+err:
+    if (fd >= 0) close(fd);
+    return -1;
+}
+
+void simple_tcp_disconnect(channel_simple_tcp_t *tcp) {
+    if (tcp->recv_watcher != NULL) {
+        uev_io_stop(tcp->recv_watcher);
+        free(tcp->recv_watcher);
+        tcp->recv_watcher = NULL;
+    }
+    if (tcp->channel_fd >= 0) {
+        close(tcp->channel_fd);
+        tcp->channel_fd = -1;
+    }
+    memset(&tcp->recv_buf, 0, sizeof(tcp->recv_buf));
+    log_info("simple_tcp disconnected");
+}
+
+void simple_tcp_incoming_conn_ev(uev_t *w, void *arg, int events) {
     channel_simple_tcp_t *tcp = arg;
     int new_fd = accept(w->fd, NULL, NULL);
     if (new_fd < 0) {
         log_error("accept() fail: %s", strerror(errno));
-        uev_io_stop(w);
         return;
     }
+
     log_info("Incoming connection ...");
-    if (tcp ->opened_channels >= 1) {
+    if (tcp->channel_fd >= 0) {
         close(new_fd);
-        log_warn("Connection closed due to existing connection.");
+        log_error("Connection refused: Cannot handle multiple connections");
         return;
     }
 
-    channel_simple_tcp_conn_t *conn = malloc(sizeof(*conn));
-    simple_tcp_conn_init(conn);
-    conn->fd = new_fd;
-    conn->packet_ready = tcp->default_packet_ready;
-    tcp->channels[tcp->opened_channels++] = conn;
+    tcp->channel_fd = new_fd;
+    tcp->recv_watcher = malloc(sizeof(uev_t));
+    uev_io_init(w->ctx, tcp->recv_watcher, simple_tcp_incoming_data_ev, tcp, new_fd, UEV_READ);
+    log_info("Connection established");
+}
 
-    uev_t *wn = malloc(sizeof(*wn));
-    uev_io_init(w->ctx, wn, simple_tcp_incoming_data, conn, new_fd, UEV_READ);
+void simple_tcp_incoming_data_ev(uev_t *w, void *arg, int events) {
+    channel_simple_tcp_t *tcp = arg;
+    simple_tcp_buf *buf = &tcp->recv_buf;
+
+    if (buf->pkt_size == 0) { // transmission header not ready
+        ssize_t recv_len = recv(w->fd, (uint8_t*)&buf->pkt.header + buf->processed_size, SIMPLE_TCP_HEADER_LEN - buf->processed_size, 0);
+        if (recv_len == 0) { // connection closed
+            simple_tcp_disconnect(tcp);
+            if (tcp->listen_fd <= 0) uev_exit(w->ctx);
+        } else if (recv_len == -1) { // connection error
+            if (errno == EAGAIN) return;
+            log_error("recv() fail: %s", strerror(errno));
+            simple_tcp_disconnect(tcp);
+            if (tcp->listen_fd <= 0) uev_exit(w->ctx);
+        } else { // (part of) header read
+            buf->processed_size += recv_len;
+            if (buf->processed_size == SIMPLE_TCP_HEADER_LEN) {
+                buf->pkt_size = ntohl(buf->pkt.header.pkt_size_be);
+                buf->processed_size = 0;
+                log_info("incoming packet of size=%d", buf->pkt_size);
+            }
+        }
+    } else { // header ready but body incomplete
+        ssize_t recv_len = recv(w->fd, (uint8_t*)&buf->pkt.body + buf->processed_size, buf->pkt_size - buf->processed_size, 0);
+        if (recv_len == 0) { // connection closed
+            simple_tcp_disconnect(tcp);
+            if (tcp->listen_fd <= 0) uev_exit(w->ctx);
+        } else if (recv_len == -1) { // connection error
+            if (errno == EAGAIN) return;
+            log_error("recv() fail: %s", strerror(errno));
+            simple_tcp_disconnect(tcp);
+            if (tcp->listen_fd <= 0) uev_exit(w->ctx);
+        } else { // (part of) header read
+            buf->processed_size += recv_len;
+            if (buf->processed_size == buf->pkt_size) {
+                tcp->packet_ready(tcp, buf->pkt.body, buf->pkt_size);
+                buf->pkt_size = 0;
+                buf->processed_size = 0;
+            }
+        }
+    }
+}
+
+static int socket_write_sync(int fd, const uint8_t buf[], size_t size) {
+    size_t rem = size;
+    size_t pos = 0;
+    while(rem > 0) {
+        ssize_t l = send(fd, buf + pos, rem, 0);
+        if (l < 0) {
+            if (errno == EAGAIN) continue;
+            return -1;
+        }
+        rem -= l;
+        pos += l;
+    }
+    return 0;
+}
+
+int simple_tcp_write(channel_simple_tcp_t *tcp, const uint8_t buf[], size_t size) {
+    if (tcp->channel_fd < 0) {
+        log_warn("tcp channel not ready");
+        return 0;
+    }
+
+    simple_tcp_pkt_header header;
+    header.pkt_size_be = htonl((uint32_t) size);
+    int success = socket_write_sync(tcp->channel_fd, (void*)&header, sizeof(header));
+    if (success < 0) return -1;
+    success = socket_write_sync(tcp->channel_fd, buf, size);
+    if (success < 0) return -1;
+    return 0;
 }

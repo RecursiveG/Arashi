@@ -2,48 +2,49 @@
 #define ARASHI_SIMPLE_TCP_H
 
 #include <stdint.h>
-#include <sys/types.h>
 #include <uev/uev.h>
+#include <linux/if_ether.h>
 
-#define SIMPLE_TCP_MAX_CONNCURRENT 16
-#define SIMPLE_TCP_MAX_PACKET 0xFFFFU
-#define SIMPLE_TCP_HEADER_LEN sizeof(uint16_t)
-
-struct _channel_simple_tcp_conn_t;
-// the size here does not contain SIMPLE_TCP_HEADER
-typedef void (simple_tcp_pkt_ready_cb)(struct _channel_simple_tcp_conn_t *conn, void *buf, size_t size);
+#define SIMPLE_TCP_MAX_PACKET ETH_MAX_MTU
+#define SIMPLE_TCP_HEADER_LEN sizeof(simple_tcp_pkt_header)
 
 typedef struct {
-    uint16_t pkt_size_be; // in network endian
-    uint8_t pkt[SIMPLE_TCP_MAX_PACKET];
-} simple_tcp_pkt;
-
-typedef struct _channel_simple_tcp_conn_t {
-    int fd;
-    //simple_tcp_pkt send_buf;
-    simple_tcp_pkt recv_buf;
-
-    // all sizes does not contain SIMPLE_TCP_HEADER_LEN;
-    //size_t send_size; // if not 0, an packet is incoming
-    //size_t sent_size; // how much has received so far
-    size_t recv_size;
-    size_t recd_size;
-
-    simple_tcp_pkt_ready_cb *packet_ready;
-} channel_simple_tcp_conn_t;
+    uint32_t pkt_size_be;
+} simple_tcp_pkt_header;
 
 typedef struct {
+    uint32_t pkt_size; // header size not included if recv_buf but included if send_buf
+    uint32_t processed_size;
+    struct {
+        simple_tcp_pkt_header header;
+        uint8_t body[SIMPLE_TCP_MAX_PACKET];
+    } pkt;
+} simple_tcp_buf;
+
+typedef struct _channel_simple_tcp_t{
     int listen_fd;
-    int opened_channels;
-    simple_tcp_pkt_ready_cb *default_packet_ready;
-    channel_simple_tcp_conn_t* channels[SIMPLE_TCP_MAX_CONNCURRENT];
+    int channel_fd;
+
+    uev_t *listen_watcher;
+    uev_t *recv_watcher;
+
+    simple_tcp_buf recv_buf;
+
+    void (*packet_ready)(struct _channel_simple_tcp_t *tcp, const uint8_t buffer[], size_t size);
 } channel_simple_tcp_t;
 
 void simple_tcp_init(channel_simple_tcp_t *tcp);
-int simple_tcp_listen(channel_simple_tcp_t *tcp, const char *addr, const char *service);
-int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *service);
+void simple_tcp_clean(channel_simple_tcp_t *tcp);
 
-void simple_tcp_incoming_conn(uev_t *w, void *arg, int events);
-void simple_tcp_incoming_data(uev_t *w, void *arg, int events);
+int simple_tcp_listen(channel_simple_tcp_t *tcp, const char *addr, const char *service, uev_ctx_t *ctx);
+void simple_tcp_deafen(channel_simple_tcp_t *tcp);
+int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *service, uev_ctx_t *ctx);
+void simple_tcp_disconnect(channel_simple_tcp_t *tcp);
+
+// libuev callbacks
+void simple_tcp_incoming_conn_ev(uev_t *w, void *arg, int events);
+void simple_tcp_incoming_data_ev(uev_t *w, void *arg, int events);
+
+int simple_tcp_write(channel_simple_tcp_t *tcp, const uint8_t buffer[], size_t size);
 
 #endif //ARASHI_SIMPLE_TCP_H

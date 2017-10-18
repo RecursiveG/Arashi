@@ -1,64 +1,44 @@
 #include "router.h"
 
 #include <stdlib.h>
-#include <netinet/in.h>
 #include <errno.h>
-#include <unistd.h>
 #include <memory.h>
 #include "external/log.h"
 
 router_t default_router;
 
-static ssize_t write_exact_socket(int socket, uint8_t buf[], size_t size) {
-    size_t rem = size;
-    size_t pos = 0;
-    while(rem > 0) {
-        ssize_t l = send(socket, buf + pos, rem, 0);
-        if (l < 0 && errno != EAGAIN) {
-            return -1;
-        } else if (l >= 0) {
-            rem -= l;
-            pos += l;
-        }
-    }
-    return size;
-}
-
 void router_init() {
     default_router.tun = NULL;
     default_router.tcp = NULL;
+    default_router.ctx = NULL;
 }
 
-void on_packet_from_tun(channel_tun_t *tun, uint8_t buffer[], size_t size) {
-    if (tun != default_router.tun) {
-        log_error("router received packet from unregistered tun device");
-        return;
-    }
-    if (default_router.tcp == NULL || default_router.tcp->opened_channels <= 0) {
+static const uint8_t XOR_MAGIC=0x5A;
+void on_packet_from_tun(channel_tun_t *tun, const uint8_t *buf, size_t size) {
+    if (default_router.tcp == NULL || default_router.tcp->channel_fd < 0) {
         log_error("no tcp channel available");
         return;
     }
-    channel_simple_tcp_conn_t *conn = default_router.tcp->channels[0];
-    *(uint16_t*)buffer = htons((uint16_t)size); // magic tun_incoming_packet
-    if (write_exact_socket(conn->fd, buffer, size+2)<0) {
-        log_fatal("tcp write fail: %s", strerror(errno));
-        exit(-2);
+    uint8_t *b = malloc(size);
+    for (size_t i=0;i<size;i++) b[i] = buf[i] ^ XOR_MAGIC;
+    if (simple_tcp_write(default_router.tcp, b, size)<0) {
+        log_error("tcp device write fail: %s", strerror(errno));
+        simple_tcp_disconnect(default_router.tcp);
+        if (default_router.tcp->channel_fd < 0) {
+            uev_exit(default_router.ctx);
+        }
     }
 }
 
-void on_packet_from_simple_tcp(channel_simple_tcp_conn_t *conn, void *buf, size_t size) {
-    if (default_router.tcp == NULL || default_router.tcp->channels[0] != conn) {
-        log_error("router received packet from unregistered tcp channel");
-        return;
-    }
-
+void on_packet_from_simple_tcp(channel_simple_tcp_t *conn, const uint8_t *buf, size_t size) {
     if (default_router.tun == NULL) {
         log_error("no tun devices available");
         return;
     }
-
-    if (write(default_router.tun->fd, buf, size)<0) {
-        log_fatal("tun write fail: %s", strerror(errno));
-        exit(-2);
+    uint8_t *b = malloc(size);
+    for (size_t i=0;i<size;i++) b[i] = buf[i] ^ XOR_MAGIC;
+    if (channel_tun_write(default_router.tun, b, size)<0) {
+        log_fatal("tun device write fail: %s", strerror(errno));
+        uev_exit(default_router.ctx);
     }
 }
