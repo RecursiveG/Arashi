@@ -2,26 +2,24 @@
 #define ARASHI_SIMPLE_TCP_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <uev/uev.h>
 #include <linux/if_ether.h>
-
-#define SIMPLE_TCP_MAX_PACKET ETH_MAX_MTU
-#define SIMPLE_TCP_HEADER_LEN sizeof(simple_tcp_pkt_header)
+#include "../router.h"
 
 typedef struct {
     uint32_t pkt_size_be;
 } simple_tcp_pkt_header;
 
 typedef struct {
-    uint32_t pkt_size; // header size not included if recv_buf but included if send_buf
-    uint32_t processed_size;
-    struct {
-        simple_tcp_pkt_header header;
-        uint8_t body[SIMPLE_TCP_MAX_PACKET];
-    } pkt;
+    pkt_t *pkt;
+    uint32_t expecting_length;
+    bool header_parsed;
 } simple_tcp_buf;
 
 typedef struct _channel_simple_tcp_t{
+    accept_pkt_f *router_pkt_handler;
+
     int listen_fd;
     int channel_fd;
 
@@ -29,8 +27,6 @@ typedef struct _channel_simple_tcp_t{
     uev_t *recv_watcher;
 
     simple_tcp_buf recv_buf;
-
-    void (*packet_ready)(struct _channel_simple_tcp_t *tcp, const uint8_t buffer[], size_t size);
 } channel_simple_tcp_t;
 
 void simple_tcp_init(channel_simple_tcp_t *tcp);
@@ -42,9 +38,9 @@ int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *
 void simple_tcp_disconnect(channel_simple_tcp_t *tcp);
 
 // libuev callbacks
-void simple_tcp_incoming_conn_ev(uev_t *w, void *arg, int events);
-void simple_tcp_incoming_data_ev(uev_t *w, void *arg, int events);
+void simple_tcp_bw_conn_ev(uev_t *w, void *arg, int events);
+void simple_tcp_bw_data_ev(uev_t *w, void *arg, int events);
 
-int simple_tcp_write(channel_simple_tcp_t *tcp, const uint8_t buffer[], size_t size);
+void simple_tcp_fw_pkt(channel_simple_tcp_t *tcp, pkt_t *pkt);
 
 #endif //ARASHI_SIMPLE_TCP_H

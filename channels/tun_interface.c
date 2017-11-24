@@ -13,11 +13,13 @@
 
 #include "../external/log.h"
 
+
 // success return 0
 int channel_tun_init(channel_tun_t *tun, const char *device_name, uev_ctx_t *ctx) {
     tun->fd = -1;
     tun->read_watcher = NULL;
-    tun->packet_ready = NULL;
+    tun->router_pkt_handler = (accept_pkt_f*)channel_tun_backward_pkt;
+    //tun->packet_ready = NULL;
     if (strlen(device_name) >= IF_NAMESIZE) {
         log_fatal("device_name too long: %s", device_name);
         exit(-3);
@@ -41,7 +43,7 @@ int channel_tun_init(channel_tun_t *tun, const char *device_name, uev_ctx_t *ctx
     } else {
         tun -> fd = fd;
         tun -> read_watcher = malloc(sizeof(uev_t));
-        uev_io_init(ctx, tun->read_watcher, channel_tun_incoming_packet_ev, tun, tun->fd, UEV_READ);
+        uev_io_init(ctx, tun->read_watcher, channel_tun_forward_event, tun, tun->fd, UEV_READ);
         return fd;
     }
 }
@@ -58,32 +60,38 @@ void channel_tun_close(channel_tun_t *tun) {
     }
 }
 
-void channel_tun_incoming_packet_ev(uev_t *w, void *arg, int events) {
+void channel_tun_forward_event(uev_t *w, void *arg, int events) {
     channel_tun_t *tun = arg;
-    size_t buffer_size = sizeof(uint8_t) * (ETH_MAX_MTU + sizeof(struct tun_pi) + 2);
-    uint8_t *buffer = malloc(buffer_size);
-    ssize_t len = read(tun->fd, buffer, buffer_size);
+    pkt_t *pkt = router_request_pkt();
+
+    uint8_t *buffer = pkt->start;
+    ssize_t signed_buffer_size = &(pkt->buf[PKT_BUFFER_SIZE]) - buffer ;
+    if (signed_buffer_size <= 0) {
+        log_fatal("tun_interface: insufficient buffer size");
+        exit(-1);
+    }
+    size_t buffer_size = (size_t) signed_buffer_size;
+    ssize_t len = read(tun->fd, pkt->start, buffer_size);
 
     if (len < 0) {
         log_fatal("tun read() error: %s", strerror(errno));
         uev_exit(w->ctx);
     } else {
+        pkt->size = (size_t)len;
         struct tun_pi *pi = (struct tun_pi *) buffer;
-        log_info("Received packet EtherType=0x%04x, size=%ld", ntohs(pi->proto), len - sizeof(*pi));
-        if (tun->packet_ready == NULL) {
-            log_warn("tun packet_ready is NULL");
-        } else {
-            tun->packet_ready(tun, buffer, (size_t) len);
-        }
+        log_trace("Received packet EtherType=0x%04x, size=%ld", ntohs(pi->proto), (size_t)len - sizeof(*pi));
+        router_packet_ready(tun, pkt);
     }
-    free(buffer);
 }
 
-int channel_tun_write(channel_tun_t *tun, const uint8_t buffer[], size_t size) {
+void channel_tun_backward_pkt(channel_tun_t *tun, pkt_t *pkt) {
     if (tun->fd < 0) {
         log_warn("tun channel not ready");
-        return 0;
+    } else {
+        ssize_t len = write(tun->fd, pkt->start, pkt->size);
+        if (len < 0) {
+            log_warn("failed to write tun device");
+        }
     }
-    ssize_t len = write(tun->fd, buffer, size);
-    return len < 0 ? -1 : 0;
+    router_recycle_pkt(pkt);
 }

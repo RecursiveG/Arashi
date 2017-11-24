@@ -7,5 +7,5 @@ You need to setup the TUN device manually.
     sudo ip link set <tun_name> up
 
     make
-    ./arashi <tun_name> <listen_port>               # server side
-    ./arashi <tun_name> <server_addr> <listen_port> # client side
+    ./arashi --tun <tun_name> --tcp-listen <listen_port>                # server side
+    ./arashi --tun <tun_name> --tcp-connect <server_addr> <listen_port> # client side

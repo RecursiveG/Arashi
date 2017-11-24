@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "channels/tun_interface.h"
 #include "channels/simple_tcp.h"
@@ -22,11 +23,110 @@ void cleanup_exit(uev_t *w, void *arg, int events)
     log_info("Server closed");
 }
 
+typedef struct {
+    char *tun_dev_name;
+
+    bool tcp_listen; // true=listen, false=connect
+    char *tcp_host;
+    char *tcp_port;
+
+    bool use_socks;
+    char *socks_host;
+    char *socks_port;
+
+    bool verbose;
+} arg_t;
+
+void print_help(void);
+#define CHECK_NEXT_PARAMETER(x) if (++i >= argc) {log_fatal("Missing parameter for \"%s\"", x);return false;}
+// return true if parsing success
+bool parse_arg(int argc, char *argv[], arg_t *arg) {
+    if (argc <= 1) {
+        print_help();
+        return false;
+    }
+
+    arg->tun_dev_name = NULL;
+    arg->verbose = false;
+
+    arg->tcp_listen = true;
+    arg->tcp_host = NULL;
+    arg->tcp_port = NULL;
+
+    arg->use_socks = false;
+    arg->socks_host = NULL;
+    arg->socks_port = NULL;
+
+    for (ssize_t i = 1; i < argc; i++) {
+        if (0 == strncmp("--tun", argv[i], 6)) {
+            CHECK_NEXT_PARAMETER("--tun");
+            arg->tun_dev_name = argv[i];
+        } else if (0 == strncmp("--tcp-connect", argv[i], 14)) {
+            CHECK_NEXT_PARAMETER("--tcp-connect")
+            CHECK_NEXT_PARAMETER("--tcp-connect")
+            arg->tcp_listen = false;
+            arg->tcp_host = argv[i-1];
+            arg->tcp_port = argv[i];
+        } else if (0 == strncmp("--tcp-listen", argv[i], 13)) {
+            CHECK_NEXT_PARAMETER("--tcp-listen")
+            arg->tcp_listen = true;
+            arg->tcp_port = argv[i];
+        } else if (0 == strncmp("--via-socks5", argv[i], 13)) {
+            CHECK_NEXT_PARAMETER("--via-socks5")
+            CHECK_NEXT_PARAMETER("--tcp-connect")
+            arg->use_socks = true;
+            arg->socks_host = argv[i-1];
+            arg->socks_port = argv[i];
+        } else if (0 == strncmp("--verbose", argv[i], 10)) {
+            arg->verbose = true;
+        } else if (0 == strncmp("--help", argv[i], 7)) {
+            print_help();
+            return false;
+        } else {
+            log_fatal("Unknown argument \"%s\"", argv[i]);
+            return false;
+        }
+    }
+
+    if (arg->tun_dev_name == NULL) {
+        log_fatal("No TUN device specified");
+        return false;
+    } else if (arg->tcp_port == NULL) {
+        log_fatal("No TCP connection specified");
+        return false;
+    } else if (arg->use_socks) {
+        log_fatal("Socks5 not implemented");
+    }
+
+    return true;
+}
+
+
+/* ./arashi
+ *     --tun [TUN device name]
+ *     --tcp-connect [peer_ip] [peer_port]
+ *     --tcp-listen [listen_port]
+ *     --via-socks5 [socks_ip] [socks_ip]
+ *     --verbose
+ */
+void print_help(void) {
+    printf(        "./arashi\n"
+                   "    --tun [TUN device name]\n"
+                   "    --tcp-connect [peer_ip] [peer_port]\n"
+                   "    --tcp-listen [listen_port]\n"
+                   "    --via-socks5 [socks_ip] [socks_ip]\n"
+                   "    --verbose\n");
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 3 && argc != 4) {
-        printf("Usage: %s <TUN_device_name> <listen_port>\n", argv[0]);
-        printf("Usage: %s <TUN_device_name> <peer> <peer_port>\n", argv[0]);
-        return -1;
+    arg_t arg;
+    if (!parse_arg(argc, argv, &arg)) {
+        exit(-1);
+    }
+    if (arg.verbose) {
+        log_set_level(LOG_DEBUG);
+    } else {
+        log_set_level(LOG_INFO);
     }
 
     uev_init(&ctx);
@@ -35,7 +135,7 @@ int main(int argc, char *argv[]) {
     uev_signal_init(&ctx, &sigint_watcher, cleanup_exit, NULL, SIGINT);
     log_info("Event context created");
 
-    const char* tun_name = argv[1];
+    const char* tun_name = arg.tun_dev_name;
     int tun_fd = channel_tun_init(&tun, tun_name, &ctx);
     if (tun_fd < 0) {
         log_fatal("failed to open tun device: %s", strerror(errno));
@@ -44,15 +144,15 @@ int main(int argc, char *argv[]) {
     log_info("TUN device allocated: fd = %d", tun_fd);
 
     simple_tcp_init(&tcp);
-    if (argc == 3) {
-        int err = simple_tcp_listen(&tcp, "0.0.0.0", argv[2], &ctx);
+    if (arg.tcp_listen) {
+        int err = simple_tcp_listen(&tcp, "0.0.0.0", arg.tcp_port, &ctx);
         if (err < 0) {
             log_fatal("failed to open listen socket: %s", strerror(errno));
             exit(-1);
         }
         log_info("Listening socket created");
     } else {
-        int channel_id = simple_tcp_connect(&tcp, argv[2], argv[3], &ctx);
+        int channel_id = simple_tcp_connect(&tcp, arg.tcp_host, arg.tcp_port, &ctx);
         if (channel_id < 0) {
             log_fatal("failed to connect: %s", strerror(errno));
             exit(-1);
@@ -62,10 +162,10 @@ int main(int argc, char *argv[]) {
 
     router_init();
     default_router.ctx = &ctx;
-    default_router.tcp = &tcp;
-    default_router.tun = &tun;
-    tcp.packet_ready = on_packet_from_simple_tcp;
-    tun.packet_ready = on_packet_from_tun;
+    router_add_forward_channel(&tun);
+    router_add_forward_channel(&tcp);
+    router_add_backward_channel(&tcp);
+    router_add_backward_channel(&tun);
 
     log_info("Server started");
     uev_run(&ctx, 0);

@@ -2,4 +2,5 @@ cmake-build-debug
 arashi
 CMakeLists.txt
 .idea
-demo.sh
+*.sh
+vgcore.*
