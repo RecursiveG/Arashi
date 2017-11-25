@@ -7,6 +7,7 @@
 
 #include "channels/tun_interface.h"
 #include "channels/simple_tcp.h"
+#include "channels/socks5_client.h"
 #include "external/log.h"
 #include "signal.h"
 #include "router.h"
@@ -14,6 +15,7 @@
 static uev_ctx_t ctx;
 static channel_tun_t tun;
 static channel_simple_tcp_t tcp;
+static socks5_client_t socks5_client;
 
 void cleanup_exit(uev_t *w, void *arg, int events)
 {
@@ -94,8 +96,8 @@ bool parse_arg(int argc, char *argv[], arg_t *arg) {
     } else if (arg->tcp_port == NULL) {
         log_fatal("No TCP connection specified");
         return false;
-    } else if (arg->use_socks) {
-        log_fatal("Socks5 not implemented");
+    } else if (arg->use_socks && arg->tcp_listen) {
+        log_fatal("Socks5 client bind not implemented");
     }
 
     return true;
@@ -152,10 +154,27 @@ int main(int argc, char *argv[]) {
         }
         log_info("Listening socket created");
     } else {
-        int channel_id = simple_tcp_connect(&tcp, arg.tcp_host, arg.tcp_port, &ctx);
-        if (channel_id < 0) {
-            log_fatal("failed to connect: %s", strerror(errno));
-            exit(-1);
+        if (arg.use_socks) {
+            socks5_init(&socks5_client);
+            log_info("connecting to socks5 server");
+            if (0 > socks5_auth(&socks5_client, arg.socks_host, arg.socks_port)) {
+                log_fatal("cannot authenticate with socks5 server", strerror(errno));
+                exit(-1);
+            }
+            log_info("connecting to tun server");
+            if (0 > socks5_connect(&socks5_client, arg.tcp_host, arg.tcp_port)) {
+                log_fatal("cannot connect to remote TUN server", strerror(errno));
+                exit(-1);
+            }
+            if (0 > simple_tcp_via_socks5(&tcp, &socks5_client, &ctx)) {
+                log_fatal("cannot connect to remote TUN server", strerror(errno));
+                exit(-1);
+            }
+        } else { // do not use socks5
+            if (0 > simple_tcp_connect(&tcp, arg.tcp_host, arg.tcp_port, &ctx)) {
+                log_fatal("failed to connect: %s", strerror(errno));
+                exit(-1);
+            }
         }
         log_info("Connected to peer");
     }

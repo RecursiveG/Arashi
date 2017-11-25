@@ -6,6 +6,7 @@
 #include <uev/uev.h>
 #include <linux/if_ether.h>
 #include "../router.h"
+#include "socks5_client.h"
 
 typedef struct {
     uint32_t pkt_size_be;
@@ -36,6 +37,8 @@ int simple_tcp_listen(channel_simple_tcp_t *tcp, const char *addr, const char *s
 void simple_tcp_deafen(channel_simple_tcp_t *tcp);
 int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *service, uev_ctx_t *ctx);
 void simple_tcp_disconnect(channel_simple_tcp_t *tcp);
+
+int simple_tcp_via_socks5(channel_simple_tcp_t *tcp, socks5_client_t *socks5_client, uev_ctx_t *ctx);
 
 // libuev callbacks
 void simple_tcp_bw_conn_ev(uev_t *w, void *arg, int events);

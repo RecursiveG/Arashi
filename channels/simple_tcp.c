@@ -1,6 +1,7 @@
 #include "simple_tcp.h"
 #include "../external/log.h"
 #include "../router.h"
+#include "socks5_client.h"
 
 #include <unistd.h>
 #include <stdlib.h>
@@ -83,6 +84,17 @@ int simple_tcp_connect(channel_simple_tcp_t *tcp, const char *addr, const char *
 err:
     if (fd >= 0) close(fd);
     return -1;
+}
+
+int simple_tcp_via_socks5(channel_simple_tcp_t *tcp, socks5_client_t *socks5_client, uev_ctx_t *ctx) {
+    if (0 > set_fd_non_block(socks5_client->fd)) {
+        if (socks5_client->fd >= 0) close(socks5_client->fd);
+        return -1;
+    }
+    tcp->channel_fd = socks5_client->fd;
+    tcp->recv_watcher = malloc(sizeof(uev_t));
+    uev_io_init(ctx, tcp->recv_watcher, simple_tcp_bw_data_ev, tcp, tcp->channel_fd, UEV_READ);
+    return 0;
 }
 
 void simple_tcp_disconnect(channel_simple_tcp_t *tcp) {
